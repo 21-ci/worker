@@ -1,0 +1,8 @@
+target
+wasm_files
+*.wasm
+.idea
+.git
+.github
+*.md
+misc
