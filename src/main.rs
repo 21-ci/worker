@@ -29,6 +29,10 @@ use wasmtime_wasi_http::{
 struct AppState {
     engine: Engine,
     modules: DashMap<String, ProxyPre<HostState>>,
+    // host -> list of (base_path, func_id). base_path is "" for root mounts
+    // or "/segment[/segment...]" otherwise. Lookup picks the longest base
+    // that segment-prefix-matches the request path.
+    domains: DashMap<String, Vec<(String, String)>>,
     wasm_files_dir: std::path::PathBuf,
     inherit_logs: bool,
     print_stats: bool,
@@ -120,10 +124,17 @@ async fn main() {
     let print_stats = env_flag("STATS_LOG");
     let auth_token = std::env::var("AUTH_TOKEN").ok().filter(|s| !s.is_empty());
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
+    let domain_bind_addr =
+        std::env::var("DOMAIN_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3030".to_string());
+
+    let domains = DashMap::new();
+    load_domains(&wasm_files_dir, &domains).await;
+    let domain_count: usize = domains.iter().map(|e| e.value().len()).sum();
 
     let state = Arc::new(AppState {
         engine,
         modules: DashMap::new(),
+        domains,
         wasm_files_dir: wasm_files_dir.clone(),
         inherit_logs,
         print_stats,
@@ -135,9 +146,14 @@ async fn main() {
         .layer(DefaultBodyLimit::max(256 * 1024 * 1024))
         .route("/:func_id", get(handle_root).post(handle_root))
         .route("/:func_id/*path", get(handle_path).post(handle_path))
-        .with_state(state);
+        .with_state(state.clone());
+
+    let domain_app = Router::new()
+        .fallback(domain_dispatch)
+        .with_state(state.clone());
 
     println!("🚀 worker on http://{bind_addr}");
+    println!("🌐 domain router on http://{domain_bind_addr} ({domain_count} mapping(s))");
     println!("📂 lazy-loading from {}", wasm_files_dir.display());
     println!(
         "⚙️  WASM_LOGS={} STATS_LOG={} AUTH={}",
@@ -147,7 +163,11 @@ async fn main() {
     );
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let dlistener = tokio::net::TcpListener::bind(&domain_bind_addr).await.unwrap();
+
+    let main_srv = axum::serve(listener, app);
+    let dom_srv = axum::serve(dlistener, domain_app);
+    let (_, _) = tokio::join!(main_srv, dom_srv);
 }
 
 fn env_flag(name: &str) -> bool {
@@ -168,6 +188,7 @@ fn create_proxy_pre(engine: &Engine, bytes: &[u8]) -> anyhow::Result<ProxyPre<Ho
 #[derive(Deserialize)]
 struct InitParams {
     name: Option<String>,
+    domain: Option<String>,
 }
 
 async fn init_wasm(
@@ -210,6 +231,28 @@ async fn init_wasm(
         );
     }
 
+    let domain_mount = match params.domain.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(d) => match parse_domain(d) {
+            Ok(parsed) => {
+                let (host, base) = &parsed;
+                let already = state
+                    .domains
+                    .get(host)
+                    .map(|e| e.value().iter().any(|(b, _)| b == base))
+                    .unwrap_or(false);
+                if already {
+                    return (
+                        StatusCode::CONFLICT,
+                        format!("domain '{host}{base}' already registered"),
+                    );
+                }
+                Some(parsed)
+            }
+            Err(e) => return (StatusCode::BAD_REQUEST, format!("invalid domain: {e}")),
+        },
+        None => None,
+    };
+
     let pre = match create_proxy_pre(&state.engine, &body) {
         Ok(p) => p,
         Err(e) => return (StatusCode::BAD_REQUEST, format!("Invalid WASM Component: {e}")),
@@ -222,6 +265,22 @@ async fn init_wasm(
         );
     }
 
+    if let Some((host, base)) = &domain_mount {
+        let sidecar = state.wasm_files_dir.join(format!("{func_id}.domain"));
+        let serialized = format!("{host}{base}");
+        if let Err(e) = tokio::fs::write(&sidecar, serialized.as_bytes()).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("write {}: {e}", sidecar.display()),
+            );
+        }
+        state
+            .domains
+            .entry(host.clone())
+            .or_default()
+            .push((base.clone(), func_id.clone()));
+    }
+
     state.modules.insert(func_id.clone(), pre);
     (StatusCode::CREATED, func_id)
 }
@@ -231,6 +290,117 @@ fn valid_name(s: &str) -> bool {
         && s.len() <= 128
         && s != "init"
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+// Parse "host" or "host/base/path" into (host_lower, base_normalized).
+// base_normalized is "" for root mounts, else "/seg[/seg...]" (no trailing
+// slash). Host: 1-253 chars of [a-zA-Z0-9.-]. Base segments: [a-zA-Z0-9._-].
+fn parse_domain(raw: &str) -> Result<(String, String), String> {
+    let raw = raw.trim().trim_start_matches('/');
+    let (host_part, base_part) = match raw.split_once('/') {
+        Some((h, b)) => (h, b),
+        None => (raw, ""),
+    };
+    let host = host_part.to_ascii_lowercase();
+    if host.is_empty() || host.len() > 253 {
+        return Err("host must be 1-253 chars".into());
+    }
+    if !host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
+        return Err("host: only [a-zA-Z0-9.-] allowed".into());
+    }
+    let base_trimmed = base_part.trim_matches('/');
+    let base = if base_trimmed.is_empty() {
+        String::new()
+    } else {
+        for seg in base_trimmed.split('/') {
+            if seg.is_empty()
+                || !seg
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+            {
+                return Err("base path: segments must be [a-zA-Z0-9._-]".into());
+            }
+        }
+        format!("/{base_trimmed}")
+    };
+    Ok((host, base))
+}
+
+async fn load_domains(dir: &std::path::Path, domains: &DashMap<String, Vec<(String, String)>>) {
+    let mut rd = match tokio::fs::read_dir(dir).await {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    while let Ok(Some(ent)) = rd.next_entry().await {
+        let p = ent.path();
+        if p.extension().and_then(|s| s.to_str()) != Some("domain") {
+            continue;
+        }
+        let func_id = match p.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let raw = match tokio::fs::read_to_string(&p).await {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let Ok((host, base)) = parse_domain(raw.trim()) else {
+            continue;
+        };
+        domains.entry(host).or_default().push((base, func_id));
+    }
+}
+
+// segment-aware prefix: "/a" matches "/a" and "/a/b" but not "/ab".
+fn base_matches(base: &str, path: &str) -> bool {
+    if base.is_empty() {
+        return true;
+    }
+    if !path.starts_with(base) {
+        return false;
+    }
+    let rest = &path[base.len()..];
+    rest.is_empty() || rest.starts_with('/')
+}
+
+async fn domain_dispatch(
+    State(state): State<Arc<AppState>>,
+    req: Request<Body>,
+) -> Response<Body> {
+    let host = req
+        .headers()
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(':').next().unwrap_or(s).to_ascii_lowercase());
+
+    let host = match host {
+        Some(h) if !h.is_empty() => h,
+        _ => return err(StatusCode::NOT_FOUND, "missing Host header"),
+    };
+
+    let path = req.uri().path().to_string();
+
+    let mount = state.domains.get(&host).and_then(|entry| {
+        entry
+            .value()
+            .iter()
+            .filter(|(base, _)| base_matches(base, &path))
+            .max_by_key(|(base, _)| base.len())
+            .map(|(base, func_id)| (base.clone(), func_id.clone()))
+    });
+
+    let (base, func_id) = match mount {
+        Some(m) => m,
+        None => return err(StatusCode::NOT_FOUND, "no domain mapping for host/path"),
+    };
+
+    let inner_path = path[base.len()..]
+        .trim_start_matches('/')
+        .to_string();
+    handle(state, func_id, inner_path, req).await
 }
 
 async fn persist_wasm(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {

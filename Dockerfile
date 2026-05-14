@@ -17,6 +17,7 @@ COPY --from=build /worker /usr/local/bin/worker
 # or via `--env-file`. Set AUTH_TOKEN to enable bearer-token auth on /init;
 # leave it unset to disable auth entirely.
 ENV BIND_ADDR=0.0.0.0:3000 \
+    DOMAIN_BIND_ADDR=0.0.0.0:3030 \
     WASM_FILES_DIR=/data/wasm_files \
     POOL_INSTANCES=8192 \
     WASM_LOGS=0 \
@@ -25,5 +26,5 @@ ENV BIND_ADDR=0.0.0.0:3000 \
 # container restarts.
 VOLUME ["/data/wasm_files"]
 
-EXPOSE 3000
+EXPOSE 3000 3030
 ENTRYPOINT ["/usr/local/bin/worker"]

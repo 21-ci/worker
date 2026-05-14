@@ -24,14 +24,17 @@ downloaded from ghcr.io), here is an example on how to run it locally:
 
 ```sh
 # run unauthenticated, components stored in ./wasm_files on the host
-docker run -p 3000:3000 ghcr.io/21ci/worker:latest -v "./wasm_files:/data/wasm_files"
+# port 3000 = path-routed API + invocation, port 3030 = domain-routed dispatch
+docker run -p 3000:3000 -p 3030:3030 -v "./wasm_files:/data/wasm_files" \
+  ghcr.io/21-ci/worker:distroless-latest
 ```
 
 ### Configuration (environments)
 
 | Var | Default                                                     | Meaning |
 |-----|-------------------------------------------------------------|---------|
-| `BIND_ADDR` | `0.0.0.0:3000`                                              | host:port to listen on |
+| `BIND_ADDR` | `0.0.0.0:3000`                                              | host:port for the path-routed API (`/init`, `/{id}`) |
+| `DOMAIN_BIND_ADDR` | `0.0.0.0:3030`                                              | host:port for the domain-routed listener (dispatches by `Host` header + path prefix) |
 | `WASM_FILES_DIR` | `<crate>/wasm_files` (source) / `/data/wasm_files` (Docker) | where enrolled `.wasm` files live |
 | `AUTH_TOKEN` | unset -> no auth                                            | bearer token required for `POST /init` |
 | `POOL_INSTANCES` | `8192`                                                      | wasmtime pooling-allocator slot count; `0` switches to OnDemand |
@@ -43,10 +46,10 @@ like below:
 
 ```sh
 docker run --rm -p 3000:3000 \
-  -v "./wasm_files:/data/wasm_files" \
+  -v "./wasm_files:/data/wasm_fileZs" \
   -e AUTH_TOKEN=$(openssl rand -hex 32) \
   -e STATS_LOG=1 \
-  ghcr.io/21ci/worker:latest
+  ghcr.io/21-ci/worker:distroless-latest
 ```
 
 ### Enrolling a component
@@ -77,6 +80,41 @@ restarts and are lazy-reloaded on first request after a restart.
 
 Then, this instance can be invoked by `curl http://localhost:3000/{NAME}` (where NAME is 
 either UUID or set name, both are received on the enrollment)
+
+### Enrolling with a domain
+
+In addition to the path-routed API on `BIND_ADDR`, worker runs a second listener
+on `DOMAIN_BIND_ADDR` (default `:3030`) that dispatches by the request's `Host`
+header and path prefix. Add `?domain=<host>[/<base/path>]` on enrollment to mount
+a component under that domain + base path.
+
+```sh
+# mount UUID-1 at test.com root (serves test.com/*)
+curl -X POST --data-binary @root.wasm \
+  "http://localhost:3000/init?name=UUID-1&domain=test.com"
+# -> UUID-1
+
+# mount UUID-2 at test.com/somefuncs (serves test.com/somefuncs/*)
+curl -X POST --data-binary @sub.wasm \
+  "http://localhost:3000/init?name=UUID-2&domain=test.com/somefuncs"
+# -> UUID-2
+```
+
+The domain listener picks the **longest matching base path**, so a request to
+`test.com/somefuncs/foo` hits UUID-2 (inner path = `/foo`), while `test.com/foo`
+falls back to UUID-1.
+
+```sh
+# hits UUID-1 (test.com root)
+curl -H "Host: test.com" http://localhost:3030/foo
+
+# hits UUID-2 (test.com/somefuncs/*)
+curl -H "Host: test.com" http://localhost:3030/somefuncs/foo
+```
+
+The domain mapping is persisted as a sidecar `${WASM_FILES_DIR}/<name>.domain`
+file and reloaded on startup. The pair `(host, base_path)` must be unique;
+re-enrolling the same `host+base` returns `409 Conflict`.
 
 
 ## Contributing
