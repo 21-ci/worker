@@ -38,6 +38,9 @@ docker run -p 3000:3000 -p 3030:3030 -v "./wasm_files:/data/wasm_files" \
 | `WASM_FILES_DIR` | `<crate>/wasm_files` (source) / `/data/wasm_files` (Docker) | where enrolled `.wasm` files live |
 | `AUTH_TOKEN` | unset -> no auth                                            | bearer token required for `POST /init` |
 | `POOL_INSTANCES` | `8192`                                                      | wasmtime pooling-allocator slot count; `0` switches to OnDemand |
+| `PREWARM_TARGET` | `100`                                                       | how many pre-instantiated instances to keep ready per component; `0` disables pre-warming |
+| `REFILL_WORKERS` | `~num_cpus / 2`                                             | parallel pre-warm refill tasks per component. More refillers keep the pool non-empty under bursty load. Does not raise sustained throughput. |
+| `INFLIGHT_MAX` | `-1`                                                        | hard cap on concurrent in-flight requests; excess requests get `503` with a DDoS-flavored message. `-1` (default) = unlimited |
 | `WASM_LOGS` | `0`                                                         | when `1`, inherit guest stdout/stderr to the host |
 | `STATS_LOG` | `0`                                                         | when `1`, print one `[stats]` line per request to stderr |
 
@@ -77,6 +80,17 @@ curl -X POST --data-binary @app.wasm \
 
 Enrolled components are written to `${WASM_FILES_DIR}/<name>.wasm` so they survive
 restarts and are lazy-reloaded on first request after a restart.
+
+On the first enroll worker also writes a precompiled `${WASM_FILES_DIR}/<name>.cwasm`
+sidecar (wasmtime's native AOT format). Every subsequent restart loads the
+`.cwasm` via `Component::deserialize_file` — no cranelift — turning the
+~minutes-long cold compile into a sub-second mmap. The `.cwasm` is tied to the
+exact wasmtime version + host CPU; delete `*.cwasm` after upgrading wasmtime
+and worker will rebuild them on next request.
+
+On startup worker scans `${WASM_FILES_DIR}` and eagerly preloads every
+component it finds (in parallel, in the background) so pre-warm pools start
+filling before the first request lands.
 
 Then, this instance can be invoked by `curl http://localhost:3000/{NAME}` (where NAME is 
 either UUID or set name, both are received on the enrollment)
